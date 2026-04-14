@@ -5,14 +5,27 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import bcrypt
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from jose import JWTError, jwt
+from pydantic import BaseModel, EmailStr
 import os
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-secret-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "60"))
+
+bearer_scheme = HTTPBearer(auto_error=False)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -77,6 +90,75 @@ activities = {
     }
 }
 
+# In-memory user store for demo purposes.
+users = {
+    "admin@mergington.edu": {
+        "email": "admin@mergington.edu",
+        "full_name": "School Admin",
+        "password_hash": bcrypt.hashpw("Admin123!".encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
+    }
+}
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def create_access_token(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXP_MINUTES)
+    payload = {
+        "sub": subject,
+        "exp": expire,
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+def decode_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        ) from exc
+
+    email = payload.get("sub")
+    if not email or email not in users:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+
+    return payload
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+
+    payload = decode_token(credentials.credentials)
+    return users[payload["sub"]]
+
 
 @app.get("/")
 def root():
@@ -86,6 +168,48 @@ def root():
 @app.get("/activities")
 def get_activities():
     return activities
+
+
+@app.post("/auth/register")
+def register_user(payload: RegisterRequest):
+    if payload.email in users:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    users[payload.email] = {
+        "email": payload.email,
+        "full_name": payload.full_name,
+        "password_hash": hash_password(payload.password),
+    }
+
+    return {
+        "message": "User registered successfully",
+        "email": payload.email,
+    }
+
+
+@app.post("/auth/login")
+def login_user(payload: LoginRequest):
+    user = users.get(payload.email)
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token(subject=payload.email)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in_minutes": JWT_EXP_MINUTES,
+    }
+
+
+@app.get("/auth/me")
+def get_my_profile(current_user: dict = Depends(get_current_user)):
+    return {
+        "email": current_user["email"],
+        "full_name": current_user.get("full_name"),
+    }
 
 
 @app.post("/activities/{activity_name}/signup")
